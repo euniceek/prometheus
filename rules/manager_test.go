@@ -355,6 +355,105 @@ func sortAlerts(items []*Alert) {
 	})
 }
 
+func TestForStateRestoreInFiringAlerts(t *testing.T) {
+	for _, queryOffset := range []time.Duration{0, time.Minute} {
+		t.Run(fmt.Sprintf("queryOffset %s", queryOffset.String()), func(t *testing.T) {
+			storage := promqltest.LoadedStorage(t, `
+		load 5m
+		http_requests{job="app-server", instance="0", group="canary", severity="overwrite-me"}	75  85 50 0 0 25 0 0 40 0 120
+		http_requests{job="app-server", instance="1", group="canary", severity="overwrite-me"}	125 90 60 0 0 25 0 0 40 0 130
+	`)
+			t.Cleanup(func() { storage.Close() })
+
+			expr, err := parser.ParseExpr(`http_requests{group="canary", job="app-server"} < 100`)
+			require.NoError(t, err)
+
+			ng := testEngine(t)
+			opts := &ManagerOptions{
+				QueryFunc:       EngineQueryFunc(ng, storage),
+				Appendable:      storage,
+				Queryable:       storage,
+				Context:         context.Background(),
+				Logger:          promslog.NewNopLogger(),
+				NotifyFunc:      func(ctx context.Context, expr string, alerts ...*Alert) {},
+				OutageTolerance: 30 * time.Minute,
+				ForGracePeriod:  10 * time.Minute,
+			}
+
+			alertForDuration := 10 * time.Minute
+
+			// Create the rule with alertForDuration.
+			rule := NewAlertingRule(
+				"HTTPRequestRateHigh",
+				expr,
+				alertForDuration,
+				0,
+				labels.FromStrings("severity", "critical"),
+				labels.EmptyLabels(), labels.EmptyLabels(), "", true, nil,
+			)
+
+			group := NewGroup(GroupOptions{
+				Name:          "default",
+				Interval:      time.Second,
+				Rules:         []Rule{rule},
+				ShouldRestore: true,
+				Opts:          opts,
+			})
+			groups := make(map[string]*Group)
+			groups["default"] = group
+			initialRuns := []time.Duration{0, 5 * time.Minute}
+
+			// Initial run to set the alerts to firing state.
+			baseTime := time.Unix(0, 0)
+			for _, duration := range initialRuns {
+				evalTime := baseTime.Add(duration)
+				group.Eval(context.TODO(), evalTime)
+			}
+
+			// Alerts should be in "firing" state at this point.
+			require.Len(t, rule.ActiveAlerts(), 2, "alerts should be firing before the restart")
+
+			// Simulate a ruler pod restart: reset the group.
+			newRule := NewAlertingRule(
+				"HTTPRequestRateHigh",
+				expr,
+				alertForDuration,
+				0,
+				labels.FromStrings("severity", "critical"),
+				labels.EmptyLabels(), labels.EmptyLabels(), "", true, nil,
+			)
+			newGroup := NewGroup(GroupOptions{
+				Name:          "default",
+				Interval:      time.Second,
+				Rules:         []Rule{newRule},
+				ShouldRestore: true,
+				Opts:          opts,
+				QueryOffset:   &queryOffset,
+			})
+
+			newGroups := make(map[string]*Group)
+			newGroups["default"] = newGroup
+
+			restoreTime := baseTime.Add(15 * time.Minute).Add(queryOffset)
+			newGroup.Eval(context.TODO(), restoreTime)
+
+			// Restore the state.
+			newGroup.RestoreForState(restoreTime)
+
+			got := newRule.ActiveAlerts()
+			require.Truef(t, newRule.Restored(), "expected the rule restoration process to have completed")
+
+			require.Equal(t, 2, len(got), "number of alerts after restoration should match")
+
+			// Ensure the alerts are still in "firing" state after restart.
+			for _, alert := range got {
+				require.Equal(t, alert.State, StatePending, "SHOULDN'T PASS: firing alert should not be in pending state after restart")
+				require.Equal(t, alert.State, StateFiring, "firing alert should still be in firing state after restart")
+			}
+		})
+	}
+}
+
 func TestForStateRestore(t *testing.T) {
 	for _, queryOffset := range []time.Duration{0, time.Minute} {
 		t.Run(fmt.Sprintf("queryOffset %s", queryOffset.String()), func(t *testing.T) {
